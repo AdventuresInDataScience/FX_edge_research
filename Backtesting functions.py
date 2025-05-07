@@ -3,15 +3,21 @@ import pandas as pd
 import numpy as np
 from datetime import datetime as dt
 from mango import scheduler, Tuner
+import matplotlib.pyplot as plt
+from scipy.stats import truncnorm 
 data_path = "C:/Users/malha/Documents/Data/FX/EURUSD_H1.csv"
 #%% Read data
 df = pd.read_csv(data_path, sep="\t", header=1, parse_dates=[0], index_col=0)
-df = df.iloc[:, :5]
+df = df.iloc[:, :5].reset_index()
+#fix date error
+date1 = pd.to_datetime(df['Time'], errors='coerce', format='%Y-%m-%d %H:%M:%S')
+date2 = pd.to_datetime(df['Time'], errors='coerce', format='%m/%d/%Y %H:%M')
+df['Time'] = date1.fillna(date2)
 # Training data, at 75% of the data
 train_size = int(len(df) * 0.75)
-train = df.iloc[:train_size].copy().reset_index()
+train = df.iloc[:train_size].copy()
 # Test data, at 25% of the data
-test = df.iloc[train_size:].copy().reset_index()
+test = df.iloc[train_size:].copy()
 
 
 #%% backest strategy function and metric functions
@@ -589,67 +595,84 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
                       stop_type='fixed', stop_unit='pips', take_profit_unit='pips',
                       trailing_step=None, trailing_bars=None,
                       bid_spread_col=None, ask_spread_col=None, slippage_col=None,
+                      risk_per_pip=0.01, risk_per_pip_is_percentage=True,
                       pip_value=0.0001):
     """
     Backtests a trading strategy with support for simultaneous long and short positions.
     
     This function uses NumPy for faster calculations and provides detailed metrics on trading performance.
     It supports both fixed and trailing stops, percentage and pip-based risk management, and
-    accounts for spread and slippage in trade execution.
-    
-    Signals are expected in the dataframe as 1 for action and 0 for no signal.
-    The signals should be in the same row as the OHLCV data they apply to. Signals generated
-    from the close of the previous bar should be shifted down to align with the next bar,
-    as trades open/close at the open price of the bar containing the signal.
+    accounts for spread and slippage in trade execution. If equity falls below 0, the backtest
+    will stop and return 0 values for all subsequent balance and equity points, simulating 
+    a real-world account bankruptcy scenario.
     
     Parameters:
     -----------
     df : pandas.DataFrame
         Dataframe with OHLCV data and signal columns
-    risk_percentage : float or str
-        If float: Percentage of balance to risk per position (0-100)
-        If str: Column name in df containing risk percentage values for each bar
-    spread : float
-        Fixed spread in pips (used if bid_spread_col and ask_spread_col are None)
-    datetime_col, open_col, high_col, low_col, close_col, volume_col : str
-        Column names for OHLCV data
-    open_buy_signal_col : str or None
-        Column name for buy position open signals (1 for signal, 0 for no signal)
-    open_sell_signal_col : str or None
-        Column name for sell position open signals (1 for signal, 0 for no signal)
-    close_buy_signal_col : str or None
-        Column name for buy position close signals (1 for signal, 0 for no signal)
-        If None, positions are only closed by SL/TP or at the end of data
-    close_sell_signal_col : str or None
-        Column name for sell position close signals (1 for signal, 0 for no signal)
-        If None, positions are only closed by SL/TP or at the end of data
-    stop_loss : float or None
-        Stop loss value in pips or percentage (None to ignore stop loss)
-    take_profit : float or None
-        Take profit value in pips or percentage (None to ignore take profit)
-    stop_type : str
-        'fixed' for regular stop-loss or 'trailing' for trailing stop
-    stop_unit : str
-        'pips' for pip-based stop loss or 'percentage' for percentage-based stop loss
-    take_profit_unit : str
-        'pips' for pip-based take profit or 'percentage' for percentage-based take profit
-    trailing_step : float or None
-        Minimum price movement in pips/percentage required to adjust trailing stop
-    trailing_bars : int or None
-        Number of bars between trailing stop adjustments (None = adjust on each bar)
-    bid_spread_col : str or None
-        Column name for variable bid spread in pips (used for sell orders)
-    ask_spread_col : str or None
-        Column name for variable ask spread in pips (used for buy orders)
-    slippage_col : str or None
-        Column name for variable slippage in pips (added to buy price, subtracted from sell price)
-    pip_value : float
-        Value of one pip in price terms (default: 0.0001 for most forex pairs)
+    risk_percentage : float or str, default=2
+        Percentage of balance to risk per trade (0-100). If string, must be a column name in df.
+    spread : float, default=1.0
+        Default spread in pips to apply when bid_spread_col and ask_spread_col not provided
+    datetime_col : str, default='Datetime'
+        Column name for datetime data
+    open_col : str, default='Open'
+        Column name for open price data
+    high_col : str, default='High'
+        Column name for high price data
+    low_col : str, default='Low'
+        Column name for low price data
+    close_col : str, default='Close'
+        Column name for close price data
+    volume_col : str, default='Volume'
+        Column name for volume data (currently not used but included for completeness)
+    open_buy_signal_col : str, default='OpenBuySignal'
+        Column name for buy entry signals (1=enter, 0=no signal)
+    open_sell_signal_col : str, default='OpenSellSignal'
+        Column name for sell entry signals (1=enter, 0=no signal)
+    close_buy_signal_col : str or None, default=None
+        Column name for buy exit signals (1=exit, 0=no signal)
+    close_sell_signal_col : str or None, default=None
+        Column name for sell exit signals (1=exit, 0=no signal)
+    stop_loss : float or None, default=None
+        Stop loss value in pips or percentage (see stop_unit)
+    take_profit : float or None, default=None
+        Take profit value in pips or percentage (see take_profit_unit)
+    stop_type : str, default='fixed'
+        Type of stop loss - 'fixed' or 'trailing'
+    stop_unit : str, default='pips'
+        Unit for stop_loss - 'pips' or 'percentage'
+    take_profit_unit : str, default='pips'
+        Unit for take_profit - 'pips' or 'percentage'
+    trailing_step : float or None, default=None
+        Minimum price movement required to adjust trailing stop (in pips or percentage)
+    trailing_bars : int or None, default=None
+        Minimum number of bars between trailing stop adjustments
+    bid_spread_col : str or None, default=None
+        Column name for dynamic bid spread values (in pips)
+    ask_spread_col : str or None, default=None
+        Column name for dynamic ask spread values (in pips)
+    slippage_col : str or None, default=None
+        Column name for dynamic slippage values (in pips)
+    risk_per_pip : float, default=0.01
+        Amount to risk per pip when stop_loss is None
+    risk_per_pip_is_percentage : bool, default=True
+        If True, risk_per_pip is a percentage of equity at trade open.
+        If False, risk_per_pip is a fixed monetary amount per pip.
+    pip_value : float, default=0.0001
+        Value of one pip in price terms (default: 0.0001 for 4-digit forex pairs)
     
     Returns:
     --------
     pandas.DataFrame
-        Dataframe with datetime, balance, equity, and trade result columns
+        Dataframe with columns:
+        - 'Datetime': Time points from the input dataframe
+        - 'Balance': Realized account balance at each point
+        - 'Equity': Account equity (balance + unrealized P/L) at each point
+        - 'TradeResult': Trade outcome at each point (0=no trade, 1=win, -1=loss)
+        
+        If equity falls below 0 during the backtest, all subsequent balance and equity
+        values will be 0, simulating account bankruptcy.
     """
     # Convert to numpy for faster processing
     n = len(df)
@@ -732,6 +755,10 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
     equity_array = np.ones(n, dtype=np.float32)
     trade_result_array = np.zeros(n, dtype=np.int8)  # 0=no trade, 1=win, -1=loss
     
+    # Track bankruptcy state
+    is_bankrupt = False
+    bankruptcy_index = -1
+    
     # Precompute flags for performance
     stop_unit_is_percentage = (stop_unit == 'percentage')
     take_profit_unit_is_percentage = (take_profit_unit == 'percentage')
@@ -767,6 +794,12 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
     
     # Main trading loop
     for i in range(n):
+        # Check for bankruptcy - if bankrupt, set all remaining values to 0 and stop trading
+        if is_bankrupt:
+            balance_array[i] = 0.0
+            equity_array[i] = 0.0
+            continue
+            
         # Get current values
         current_open = open_array[i]
         current_high = high_array[i]
@@ -788,7 +821,7 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
             # Adjust entry price for spread and slippage (buy at ask + slippage)
             buy_actual_entry_price = buy_entry_price + (current_ask_spread * pip_value) + (current_slippage * pip_value)
             
-            # Set stop loss price based on unit
+            # Calculate stop loss price if provided
             if has_stop_loss:
                 if not stop_unit_is_percentage:
                     # Pip-based stop loss
@@ -797,7 +830,7 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
                     # Percentage-based stop loss
                     buy_stop_loss_price = buy_entry_price * (1 - stop_loss / 100)
             
-            # Set take profit price based on unit
+            # Set take profit price based on unit (works even without stop loss)
             if has_take_profit:
                 if not take_profit_unit_is_percentage:
                     # Pip-based take profit
@@ -806,25 +839,31 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
                     # Percentage-based take profit
                     buy_take_profit_price = buy_entry_price * (1 + take_profit / 100)
             
-            # Calculate position size based on risk percentage
+            # Calculate position size based on risk approach
+            risk_amount = current_balance * (current_risk_percentage / 100)
+            
             if has_stop_loss:
-                risk_amount = current_balance * (current_risk_percentage / 100)
-                
-                if not stop_unit_is_percentage:
-                    pip_risk = stop_loss * pip_value  # Convert pips to price
+                # Use stop loss for position sizing (stop_loss takes precedence)
+                price_difference = buy_actual_entry_price - buy_stop_loss_price
+                if price_difference > 0:
+                    buy_position_size = risk_amount / price_difference
                 else:
-                    pip_risk = buy_entry_price * stop_loss / 100  # Convert percentage to price
-                    
-                buy_position_size = risk_amount / pip_risk if pip_risk > 0 else 0
+                    buy_position_size = 0  # Avoid division by zero or negative differences
             else:
-                # Without stop loss, risk a fixed percentage of balance
-                risk_amount = current_balance * (current_risk_percentage / 100)
-                default_pip_risk = 100 * pip_value
-                buy_position_size = risk_amount / default_pip_risk
+                # Use risk_per_pip for position sizing
+                if risk_per_pip_is_percentage:
+                    # Calculate actual monetary amount based on percentage of equity
+                    pip_risk_value = current_equity * (risk_per_pip / 100)
+                else:
+                    # Use fixed monetary amount directly
+                    pip_risk_value = risk_per_pip
+                
+                # Calculate position size: monetary risk per pip / pip_value
+                buy_position_size = pip_risk_value / pip_value
             
             buy_trade_open = True
         
-        # Check for sell signal - don't check close_sell_array to avoid error when it's None
+        # Check for sell signal
         if not sell_trade_open and open_sell_array[i] == 1:
             # Open a sell trade at the open price of current bar
             sell_entry_price = current_open
@@ -835,7 +874,7 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
             # Adjust entry price for spread and slippage (sell at bid - slippage)
             sell_actual_entry_price = sell_entry_price - (current_bid_spread * pip_value) - (current_slippage * pip_value)
             
-            # Set stop loss price based on unit
+            # Calculate stop loss price if provided
             if has_stop_loss:
                 if not stop_unit_is_percentage:
                     # Pip-based stop loss
@@ -844,7 +883,7 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
                     # Percentage-based stop loss
                     sell_stop_loss_price = sell_entry_price * (1 + stop_loss / 100)
             
-            # Set take profit price based on unit
+            # Set take profit price based on unit (works even without stop loss)
             if has_take_profit:
                 if not take_profit_unit_is_percentage:
                     # Pip-based take profit
@@ -853,21 +892,27 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
                     # Percentage-based take profit
                     sell_take_profit_price = sell_entry_price * (1 - take_profit / 100)
             
-            # Calculate position size based on risk percentage
+            # Calculate position size based on risk approach
+            risk_amount = current_balance * (current_risk_percentage / 100)
+            
             if has_stop_loss:
-                risk_amount = current_balance * (current_risk_percentage / 100)
-                
-                if not stop_unit_is_percentage:
-                    pip_risk = stop_loss * pip_value  # Convert pips to price
+                # Use stop loss for position sizing (stop_loss takes precedence)
+                price_difference = sell_stop_loss_price - sell_actual_entry_price
+                if price_difference > 0:
+                    sell_position_size = risk_amount / price_difference
                 else:
-                    pip_risk = sell_entry_price * stop_loss / 100  # Convert percentage to price
-                    
-                sell_position_size = risk_amount / pip_risk if pip_risk > 0 else 0
+                    sell_position_size = 0  # Avoid division by zero or negative differences
             else:
-                # Without stop loss, risk a fixed percentage of balance
-                risk_amount = current_balance * (current_risk_percentage / 100)
-                default_pip_risk = 100 * pip_value
-                sell_position_size = risk_amount / default_pip_risk
+                # Use risk_per_pip for position sizing
+                if risk_per_pip_is_percentage:
+                    # Calculate actual monetary amount based on percentage of equity
+                    pip_risk_value = current_equity * (risk_per_pip / 100)
+                else:
+                    # Use fixed monetary amount directly
+                    pip_risk_value = risk_per_pip
+                
+                # Calculate position size: monetary risk per pip / pip_value
+                sell_position_size = pip_risk_value / pip_value
             
             sell_trade_open = True
         
@@ -1037,9 +1082,25 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
         # Current equity = balance + unrealized PnL
         current_equity = current_balance + unrealized_buy_pnl + unrealized_sell_pnl
         
+        # Check for bankruptcy
+        if current_equity <= 0:
+            is_bankrupt = True
+            bankruptcy_index = i
+            current_equity = 0
+            current_balance = 0
+            
+            # Close any open positions (they are worthless now)
+            buy_trade_open = False
+            sell_trade_open = False
+        
         # Store current balance and equity for this row
         balance_array[i] = current_balance
         equity_array[i] = current_equity
+    
+    # If bankruptcy occurred, set all future values to 0
+    if is_bankrupt:
+        balance_array[bankruptcy_index:] = 0.0
+        equity_array[bankruptcy_index:] = 0.0
     
     # Create and return the results dataframe
     result_df = pd.DataFrame({
@@ -1076,26 +1137,24 @@ def FX_single_backtest(df, risk_percentage=2, spread=1.0,
     return result_df
 
 #%% testing FX_single_backtest function
-train['OpenBuySignal'] = np.random.randint(0, 2, size=len(train))
-train['CloseBuySignal'] = np.random.randint(0, 2, size=len(train))
-
-
-output = FX_single_backtest(train, risk_percentage=2, spread=0, 
+test['OpenBuySignal'] = SMAIndicator(test['Close'], window=5).sma_indicator() > SMAIndicator(test['Close'], window=20).sma_indicator()
+test['CloseBuySignal'] = SMAIndicator(test['Close'], window=5).sma_indicator() < SMAIndicator(test['Close'], window=20).sma_indicator()
+test['OpenSellSignal'] = SMAIndicator(test['Close'], window=10).sma_indicator() < SMAIndicator(test['Close'], window=50).sma_indicator()
+test['CloseSellSignal'] = SMAIndicator(test['Close'], window=0).sma_indicator() > SMAIndicator(test['Close'], window=50).sma_indicator()
+test['slippage'] = np.log(truncnorm.rvs(1,np.e, size=len(test)))
+output = FX_single_backtest(test, risk_percentage=5, spread=1.2, 
                       datetime_col='Time', open_col='Open', high_col='High', 
                       low_col='Low', close_col='Close', volume_col='Volume',
                       open_buy_signal_col='OpenBuySignal', open_sell_signal_col=None, 
                       close_buy_signal_col='CloseBuySignal', close_sell_signal_col=None,
-                      stop_loss=5, take_profit=None, 
+                      stop_loss=None, take_profit=None, 
                       stop_type='trailing', stop_unit='percentage', take_profit_unit='pips',
                       trailing_step=None, trailing_bars=1,
-                      bid_spread_col=None, ask_spread_col=None, slippage_col=None,
+                      bid_spread_col=None, ask_spread_col=None, slippage_col="slippage",
+                      risk_per_pip=10, risk_per_pip_is_percentage=True,
                       pip_value=0.0001)
 
-output['Balance'].plot()
-
-
-
-
+plt.plot(output['Datetime'].values, output['Balance'].values)
 
 
 
